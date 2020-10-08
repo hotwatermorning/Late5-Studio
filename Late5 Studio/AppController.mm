@@ -17,6 +17,11 @@
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/gui/iplugview.h"
+#include "public.sdk/source/common/memorystream.h"
+// memorystream.cpp が libsdk.a に含まれていないので、この memorystream.cpp をインクルードして直接コンパイルする。
+// この方法はちょっと横着なので、ここで memorystream.cpp を直接インクルードするよりも、
+// memorystream.cpp を IDE のプロジェクトに追加してちゃんとコンパイルするようにしたほうが良い。
+#include "public.sdk/source/common/memorystream.cpp"
 #include "CEditorHost.h"
 
 using namespace Steinberg;
@@ -547,17 +552,25 @@ typedef bool (*BundleEntryFunc) (CFBundleRef);
                 
                 //getControllerClassId()で取得したEditControllerのCIDを使ってcreateInstance()する
                 TUID controllerClassId;
+                Vst::IEditController *editController = NULL;
+                bool needToInitializeEditController = false;
                 res = iComponent->getControllerClassId(controllerClassId);
                 if (res != kResultOk){
-                    NSLog(@"failed with getControllerClassId(fx) with %d", res);
-                    continue;
+                    res = iComponent->queryInterface(Vst::IEditController::iid, (void**)&editController);
+                    if(res != kResultOk) {
+                        NSLog(@"failed with getControllerClassId(fx) with %d", res);
+                        continue;
+                    }
+                } else {
+                    needToInitializeEditController = true;
+                    res = pluginFactory->createInstance(controllerClassId, Vst::IEditController::iid,
+                                                        (void **)&editController);
                 }
-                
-                Vst::IEditController *editController = NULL;
-                res = pluginFactory->createInstance(controllerClassId, Vst::IEditController::iid,
-                                                    (void **)&editController);
+
                 if (editController){
-                    [self IEditorControllerObtained:editController];
+                    [self IEditorControllerObtained:editController
+                                      withComponent:iComponent
+                                   needToInitialize:needToInitializeEditController];
                 }else{
                     NSLog(@"failed for createInstance for controller, IEditController. res = %d", res);
                     continue;
@@ -581,18 +594,23 @@ typedef bool (*BundleEntryFunc) (CFBundleRef);
 }
 
 //
--(void)IEditorControllerObtained:(Vst::IEditController *)editorController{
+-(void)IEditorControllerObtained:(Vst::IEditController *)editorController
+                withComponent:(Vst::IComponent *)component
+                needToInitialize:(bool)needToInitialize
+{
     tresult res = 0;
-    
-    //適当なやつを渡す。
-    res = editorController->initialize(&hostApplication);
-    if (res != kResultOk){
-        NSLog(@"    failed with initialize");
-        return;
-    }else{
-        NSLog(@"    OK to initialize");
+
+    if(needToInitialize) {
+        //適当なやつを渡す。
+        res = editorController->initialize(&hostApplication);
+        if (res != kResultOk){
+            NSLog(@"    failed with initialize");
+            return;
+        }else{
+            NSLog(@"    OK to initialize");
+        }
     }
-    
+
     //適当なやつを渡す。
     res = editorController->setComponentHandler(&componentHandler);
     if(res != kResultOk){
@@ -600,6 +618,35 @@ typedef bool (*BundleEntryFunc) (CFBundleRef);
         return;
     }else{
         NSLog(@"    OK to setComponentHandler");
+    }
+
+    // IComponent と IEditController の相互接続を確立する
+    Steinberg::FUnknownPtr<Vst::IConnectionPoint> connForComponent(component);
+    Steinberg::FUnknownPtr<Vst::IConnectionPoint> connForEditController(editorController);
+
+    if( connForComponent && connForEditController) {
+        connForComponent->connect(connForEditController);
+        connForEditController->connect(connForComponent);
+    } else {
+        NSLog(@"    failed to get connection points");
+    }
+
+    // IEditController の状態を IComponent の状態を元に初期化する。
+    Steinberg::MemoryStream stream;
+
+    if(component->getState (&stream) != kResultOk) {
+        NSLog(@"    failed to get component state");
+        return;
+    }
+
+    stream.seek(0, Steinberg::IBStream::IStreamSeekMode::kIBSeekSet, 0);
+    res = editorController->setComponentState (&stream);
+
+    // JUCE 製のプラグインでは、 setComponentState() の呼び出しで
+    // kResultOk ではなく kNotImplemented が返ってくることがある。
+    if(res != kResultOk && res != kNotImplemented) {
+        NSLog(@"    failed to set component state to IEditController");
+        return;
     }
     
     //ここまではエラーなしで来ることを確認済み。
